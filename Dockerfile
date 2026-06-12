@@ -32,4 +32,9 @@ COPY --chown=user app.py ./app.py
 USER user
 EXPOSE 7860
 
-CMD ["streamlit", "run", "app.py", "--server.port=7860", "--server.address=0.0.0.0"]
+# --server.enableXsrfProtection=false / --enableCORS=false: required for the
+# file uploader to work behind Hugging Face's reverse proxy (otherwise the
+# upload POST is rejected with "AxiosError: Request failed with status code 403").
+CMD ["streamlit", "run", "app.py", \
+     "--server.port=7860", "--server.address=0.0.0.0", \
+     "--server.enableXsrfProtection=false", "--server.enableCORS=false"]
