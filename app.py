@@ -427,6 +427,60 @@ async def _download_documents(page, docs: list[dict], order: dict, temp_dir: str
     return saved
 
 
+async def _block_heavy(route):
+    """Abort image/font/media requests — the automation needs only DOM + JS.
+    This keeps Chromium's memory under the free-tier ceiling so the heavy
+    authenticated portal pages don't get the browser OOM-killed."""
+    try:
+        if route.request.resource_type in ("image", "media", "font"):
+            await route.abort()
+        else:
+            await route.continue_()
+    except Exception:
+        try:
+            await route.continue_()
+        except Exception:
+            pass
+
+
+async def _new_session(p):
+    """Launch a memory-frugal Chromium session and return (browser, ctx, page)."""
+    browser = await p.chromium.launch(
+        headless=True,
+        args=[
+            # --disable-dev-shm-usage routes Chromium's shared memory to /tmp;
+            # the container's /dev/shm is only ~64 MB. The rest trim memory/GPU.
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-software-rasterizer",
+            "--disable-extensions",
+            "--disable-background-networking",
+            "--disable-renderer-backgrounding",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-features=site-per-process,TranslateUI",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--mute-audio",
+        ],
+    )
+    # Present as a normal European desktop Chrome — Playwright's default user
+    # agent contains "HeadlessChrome", which many corporate firewalls block.
+    # A real UA + German locale/timezone also keeps the portal in the language
+    # the rest of the automation expects.
+    ctx = await browser.new_context(
+        locale="de-DE",
+        timezone_id="Europe/Berlin",
+        user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"),
+        extra_http_headers={"Accept-Language": "de-DE,de;q=0.9,en;q=0.8"},
+    )
+    await ctx.route("**/*", _block_heavy)
+    page = await ctx.new_page()
+    return browser, ctx, page
+
+
 async def _run_async(orders, username, password, temp_dir: str, state: dict):
     """Login once, then process all orders sequentially in one browser session."""
     from playwright.async_api import async_playwright, TimeoutError as PWTimeout
@@ -435,49 +489,43 @@ async def _run_async(orders, username, password, temp_dir: str, state: dict):
     from_date = earliest_from_date(orders)
 
     async with async_playwright() as p:
-        # --disable-dev-shm-usage is essential on Streamlit Cloud: the container's
-        # /dev/shm is tiny (~64 MB) and Chromium crashes ("Target page/context/
-        # browser has been closed") when it fills. Routing shared memory to /tmp
-        # plus the other low-memory flags keeps the browser alive on the free tier.
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-software-rasterizer",
-                "--disable-extensions",
-                "--disable-background-networking",
-                "--disable-renderer-backgrounding",
-                "--disable-features=site-per-process,TranslateUI",
-                "--no-first-run",
-                "--no-default-browser-check",
-            ],
-        )
-        # Present as a normal European desktop Chrome — Playwright's default
-        # user agent contains "HeadlessChrome", which many corporate firewalls
-        # block. A real UA + German locale/timezone also keeps the portal in
-        # the language the rest of the automation expects.
-        ctx = await browser.new_context(
-            locale="de-DE",
-            timezone_id="Europe/Berlin",
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/120.0.0.0 Safari/537.36"),
-            extra_http_headers={"Accept-Language": "de-DE,de;q=0.9,en;q=0.8"},
-        )
-        page = await ctx.new_page()
+        # Log in inside a retry loop — on the free tier Chromium can be killed
+        # mid-login by the kernel under memory pressure ("Target page/context/
+        # browser has been closed"); a fresh relaunch usually succeeds.
+        browser = ctx = page = None
+        last_diag = ""
+        logged_in = False
+        for attempt in range(2):
+            try:
+                browser, ctx, page = await _new_session(p)
+                state["status"] = (
+                    "Logging in to the TKE portal…"
+                    if attempt == 0 else "Login retry…"
+                )
+                ok, last_diag = await _login(page, username, password)
+                if ok:
+                    logged_in = True
+                    break
+            except Exception as exc:
+                last_diag = f"browser crashed during login ({exc})"
+            # Tear down before retrying.
+            try:
+                if browser:
+                    await browser.close()
+            except Exception:
+                pass
+            browser = ctx = page = None
 
-        state["status"] = "Logging in to the TKE portal…"
-        ok, diag = await _login(page, username, password)
-        if not ok:
+        if not logged_in:
             state["error"] = (
-                "Login failed. This usually means the portal rejected the "
-                "credentials OR blocked the server's location. Diagnostic: "
-                + diag
+                "Login failed. If the diagnostic mentions the browser being "
+                "closed, the free Streamlit tier ran out of memory rendering "
+                "the portal; otherwise the credentials may be wrong. "
+                "Diagnostic: " + last_diag
             )
             state["done"] = True
-            await browser.close()
+            if browser:
+                await browser.close()
             return
 
         for i, order in enumerate(orders):
