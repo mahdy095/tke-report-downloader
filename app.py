@@ -460,25 +460,31 @@ async def _block_heavy(route):
 
 async def _new_session(p):
     """Launch a memory-frugal Chromium session and return (browser, ctx, page)."""
-    browser = await p.chromium.launch(
-        headless=True,
-        args=[
-            # --disable-dev-shm-usage routes Chromium's shared memory to /tmp;
-            # the container's /dev/shm is only ~64 MB. The rest trim memory/GPU.
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--disable-software-rasterizer",
-            "--disable-extensions",
-            "--disable-background-networking",
-            "--disable-renderer-backgrounding",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-features=site-per-process,TranslateUI",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--mute-audio",
-        ],
-    )
+    args = [
+        # --disable-dev-shm-usage routes Chromium's shared memory to /tmp;
+        # the container's /dev/shm is only ~64 MB. The rest trim memory/GPU.
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-software-rasterizer",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-renderer-backgrounding",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-features=site-per-process,TranslateUI",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--mute-audio",
+    ]
+    # On the Linux cloud container the browser process is killed when Chromium
+    # tries to spawn its child processes (renderer/GPU/zygote) on navigation —
+    # diagnosed as browser.disconnected WITHOUT a page.crash, i.e. a process-
+    # model failure in the locked-down sandbox, not OOM. Collapsing everything
+    # into one process avoids the child-spawning that the container blocks.
+    # Kept Linux-only so the proven multi-process path stays on local Windows.
+    if sys.platform.startswith("linux"):
+        args += ["--single-process", "--no-zygote"]
+    browser = await p.chromium.launch(headless=True, args=args)
     # Present as a normal European desktop Chrome — Playwright's default user
     # agent contains "HeadlessChrome", which many corporate firewalls block.
     # A real UA + German locale/timezone also keeps the portal in the language
