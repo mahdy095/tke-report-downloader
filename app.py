@@ -232,26 +232,77 @@ def earliest_from_date(orders: list[dict]) -> str:
 
 # ── Playwright automation ─────────────────────────────────────────────────────
 
-async def _login(page, username: str, password: str) -> bool:
-    """Navigate to the portal and authenticate. Returns True on success."""
-    await page.goto(PORTAL_ORDERS_URL, wait_until="domcontentloaded", timeout=45_000)
+async def _dismiss_cookie_banner(page):
+    """Click a cookie-consent button if one is overlaying the login form."""
+    for label in ("Alle akzeptieren", "Accept all", "Akzeptieren", "Accept",
+                  "Zustimmen", "Einverstanden", "Alle Cookies akzeptieren", "OK"):
+        try:
+            btn = page.locator(f'button:has-text("{label}")').first
+            if await btn.count() > 0 and await btn.is_visible():
+                await btn.click(timeout=3_000)
+                await page.wait_for_timeout(500)
+                return
+        except Exception:
+            continue
+
+
+async def _page_diag(page, note: str) -> str:
+    """Capture a short description of the current page for failure diagnosis."""
+    try:
+        url = page.url
+        title = await page.title()
+        text = await page.evaluate(
+            "() => (document.body.innerText || '').replace(/\\s+/g,' ').trim().substring(0, 300)"
+        )
+        login_visible = await page.locator("#username").count() > 0
+        return (f"{note} — url={url[:90]} | title={title!r} | "
+                f"login_form_still_visible={login_visible} | page_says={text!r}")
+    except Exception as exc:
+        return f"{note} — (could not read page: {exc})"
+
+
+async def _login(page, username: str, password: str):
+    """
+    Navigate to the portal and authenticate.
+    Returns (ok: bool, diagnostic: str); diagnostic is "" on success.
+    """
+    await page.goto(PORTAL_ORDERS_URL, wait_until="domcontentloaded", timeout=60_000)
 
     # Already inside (shouldn't happen on a fresh context, but harmless)
     if await page.locator("#ServiceOrderSearchSearchFormid_field").count() > 0:
-        return True
+        return True, ""
 
-    await page.wait_for_selector("#username", timeout=20_000)
-    await page.fill("#username", username)
-    await page.fill("#password", password)
-    await page.locator("#password").press("Enter")
+    await _dismiss_cookie_banner(page)
 
     try:
-        await page.wait_for_selector(
-            "#ServiceOrderSearchSearchFormid_field", timeout=25_000
-        )
-        return True
+        await page.wait_for_selector("#username", timeout=30_000)
     except Exception:
-        return False
+        return False, await _page_diag(page, "no login form appeared")
+
+    await page.fill("#username", username)
+    await page.fill("#password", password)
+
+    # Primary submit: Enter in the password field (fires the form's onkeypress).
+    await page.locator("#password").press("Enter")
+    try:
+        await page.wait_for_selector("#ServiceOrderSearchSearchFormid_field", timeout=35_000)
+        return True, ""
+    except Exception:
+        pass
+
+    # Fallback submit: click the hidden submit input directly.
+    try:
+        await page.evaluate(
+            """() => {
+                const b = document.querySelector('form[name="form.login"] input[type="submit"]')
+                       || document.querySelector('input[type="submit"][name="Submit"]');
+                if (b) b.click();
+            }"""
+        )
+        await page.wait_for_selector("#ServiceOrderSearchSearchFormid_field", timeout=35_000)
+        return True, ""
+    except Exception:
+        return False, await _page_diag(page, "credentials submitted but the orders page never loaded")
 
 
 async def _search_and_open(page, order_id: str, from_date: str) -> str:
@@ -385,13 +436,28 @@ async def _run_async(orders, username, password, temp_dir: str, state: dict):
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        ctx = await browser.new_context()
+        # Present as a normal European desktop Chrome — Playwright's default
+        # user agent contains "HeadlessChrome", which many corporate firewalls
+        # block. A real UA + German locale/timezone also keeps the portal in
+        # the language the rest of the automation expects.
+        ctx = await browser.new_context(
+            locale="de-DE",
+            timezone_id="Europe/Berlin",
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"),
+            extra_http_headers={"Accept-Language": "de-DE,de;q=0.9,en;q=0.8"},
+        )
         page = await ctx.new_page()
 
         state["status"] = "Logging in to the TKE portal…"
-        if not await _login(page, username, password):
-            state["error"] = ("Login failed — the portal did not accept the "
-                              "username/password. Please check your credentials.")
+        ok, diag = await _login(page, username, password)
+        if not ok:
+            state["error"] = (
+                "Login failed. This usually means the portal rejected the "
+                "credentials OR blocked the server's location. Diagnostic: "
+                + diag
+            )
             state["done"] = True
             await browser.close()
             return
