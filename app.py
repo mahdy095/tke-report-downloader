@@ -170,7 +170,15 @@ STATUS_META = {
 
 
 def _secret_credentials():
-    """Return (username, password) from Streamlit secrets, or (None, None)."""
+    """
+    Return (username, password) from configured secrets, or (None, None).
+    Checks environment variables first (Hugging Face Spaces injects secrets
+    as env vars) and falls back to Streamlit secrets (Streamlit Cloud).
+    """
+    env_user = os.environ.get("TKE_USERNAME")
+    env_pass = os.environ.get("TKE_PASSWORD")
+    if env_user and env_pass:
+        return env_user, env_pass
     try:
         return st.secrets["tke"]["username"], st.secrets["tke"]["password"]
     except Exception:
@@ -476,13 +484,11 @@ async def _new_session(p):
         "--no-default-browser-check",
         "--mute-audio",
     ]
-    # On the Linux cloud container the browser process is killed when Chromium
-    # tries to spawn its child processes (renderer/GPU/zygote) on navigation —
-    # diagnosed as browser.disconnected WITHOUT a page.crash, i.e. a process-
-    # model failure in the locked-down sandbox, not OOM. Collapsing everything
-    # into one process avoids the child-spawning that the container blocks.
-    # Kept Linux-only so the proven multi-process path stays on local Windows.
-    if sys.platform.startswith("linux"):
+    # Opt-in single-process mode (set TKE_SINGLE_PROCESS=1). Only needed on
+    # heavily sandboxed hosts that block Chromium's child-process spawning;
+    # on a normal container (Hugging Face Docker, local) multi-process is more
+    # stable, matching the proven local path.
+    if os.environ.get("TKE_SINGLE_PROCESS") == "1":
         args += ["--single-process", "--no-zygote"]
     browser = await p.chromium.launch(headless=True, args=args)
     # Present as a normal European desktop Chrome — Playwright's default user
