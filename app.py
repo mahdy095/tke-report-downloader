@@ -246,6 +246,20 @@ async def _dismiss_cookie_banner(page):
             continue
 
 
+def _mem_info() -> str:
+    """Read container memory from /proc/meminfo (Linux only) for diagnosis."""
+    try:
+        vals = {}
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                key, _, rest = line.partition(":")
+                vals[key.strip()] = rest.strip()
+        return (f"MemTotal={vals.get('MemTotal','?')}, "
+                f"MemAvailable={vals.get('MemAvailable','?')}")
+    except Exception:
+        return "mem info unavailable (non-Linux or no /proc)"
+
+
 async def _page_diag(page, note: str) -> str:
     """Capture a short description of the current page for failure diagnosis."""
     try:
@@ -258,7 +272,7 @@ async def _page_diag(page, note: str) -> str:
         return (f"{note} — url={url[:90]} | title={title!r} | "
                 f"login_form_still_visible={login_visible} | page_says={text!r}")
     except Exception as exc:
-        return f"{note} — (could not read page: {exc})"
+        return f"{note} — (could not read page: {type(exc).__name__}: {exc})"
 
 
 async def _login(page, username: str, password: str):
@@ -301,8 +315,9 @@ async def _login(page, username: str, password: str):
         )
         await page.wait_for_selector("#ServiceOrderSearchSearchFormid_field", timeout=35_000)
         return True, ""
-    except Exception:
-        return False, await _page_diag(page, "credentials submitted but the orders page never loaded")
+    except Exception as exc:
+        note = f"credentials submitted but the orders page never loaded ({type(exc).__name__}: {exc})"
+        return False, await _page_diag(page, note)
 
 
 async def _search_and_open(page, order_id: str, from_date: str) -> str:
@@ -495,9 +510,17 @@ async def _run_async(orders, username, password, temp_dir: str, state: dict):
         browser = ctx = page = None
         last_diag = ""
         logged_in = False
+        events = []          # renderer-crash / browser-disconnect signals
+        mem_start = _mem_info()
         for attempt in range(2):
             try:
                 browser, ctx, page = await _new_session(p)
+                # Record process-death signals — a renderer "crash" almost
+                # always means an OOM kill; "disconnected" means the whole
+                # browser process went away.
+                page.on("crash", lambda *_: events.append(f"page.crash@attempt{attempt}"))
+                browser.on("disconnected",
+                           lambda *_: events.append(f"browser.disconnected@attempt{attempt}"))
                 state["status"] = (
                     "Logging in to the TKE portal…"
                     if attempt == 0 else "Login retry…"
@@ -507,7 +530,7 @@ async def _run_async(orders, username, password, temp_dir: str, state: dict):
                     logged_in = True
                     break
             except Exception as exc:
-                last_diag = f"browser crashed during login ({exc})"
+                last_diag = f"exception during login ({type(exc).__name__}: {exc})"
             # Tear down before retrying.
             try:
                 if browser:
@@ -518,10 +541,10 @@ async def _run_async(orders, username, password, temp_dir: str, state: dict):
 
         if not logged_in:
             state["error"] = (
-                "Login failed. If the diagnostic mentions the browser being "
-                "closed, the free Streamlit tier ran out of memory rendering "
-                "the portal; otherwise the credentials may be wrong. "
-                "Diagnostic: " + last_diag
+                "Login failed. Diagnostic: " + last_diag
+                + f" || events={events or 'none'}"
+                + f" || mem_at_start=({mem_start})"
+                + f" || mem_at_fail=({_mem_info()})"
             )
             state["done"] = True
             if browser:
