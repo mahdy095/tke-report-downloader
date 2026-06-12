@@ -435,7 +435,25 @@ async def _run_async(orders, username, password, temp_dir: str, state: dict):
     from_date = earliest_from_date(orders)
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+        # --disable-dev-shm-usage is essential on Streamlit Cloud: the container's
+        # /dev/shm is tiny (~64 MB) and Chromium crashes ("Target page/context/
+        # browser has been closed") when it fills. Routing shared memory to /tmp
+        # plus the other low-memory flags keeps the browser alive on the free tier.
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-software-rasterizer",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-renderer-backgrounding",
+                "--disable-features=site-per-process,TranslateUI",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ],
+        )
         # Present as a normal European desktop Chrome — Playwright's default
         # user agent contains "HeadlessChrome", which many corporate firewalls
         # block. A real UA + German locale/timezone also keeps the portal in
