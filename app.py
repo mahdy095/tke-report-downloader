@@ -23,10 +23,23 @@ import pandas as pd
 # ── Chromium installation (cached, runs once per deployment) ──────────────────
 @st.cache_resource(show_spinner=False)
 def _install_chromium():
+    # If Chromium is already on disk — baked into the Docker image at build
+    # time (Hugging Face Space) or installed locally — skip the runtime
+    # download entirely. The download can take minutes and times out on some
+    # hosts even when a browser is already present.
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as pw:
+            exe = pw.chromium.executable_path
+        if exe and os.path.exists(exe):
+            return True, f"Chromium already present at {exe}"
+    except Exception:
+        pass
+    # Otherwise download it (e.g. Streamlit Cloud, where it is not pre-installed).
     try:
         result = subprocess.run(
             [sys.executable, "-m", "playwright", "install", "chromium"],
-            capture_output=True, text=True, timeout=180,
+            capture_output=True, text=True, timeout=300,
         )
         return result.returncode == 0, (result.stdout + result.stderr).strip()
     except Exception as exc:
