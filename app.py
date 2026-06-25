@@ -443,7 +443,9 @@ async def _download_documents(page, docs: list[dict], order: dict, temp_dir: str
     name_counts: dict[str, int] = {}
 
     for doc in docs:
-        base = f"{order['equipment_id']}_{order['order_id']}_{safe_name(doc['doc_type'])}"
+        # safe_name every part — some equipment IDs contain "/" (e.g. "703/11787"),
+        # which would otherwise be read as a folder path in the ZIP entry name.
+        base = f"{safe_name(order['equipment_id'])}_{order['order_id']}_{safe_name(doc['doc_type'])}"
         base = base.strip("_")
         name_counts[base] = name_counts.get(base, 0) + 1
         fname = f"{base}.pdf" if name_counts[base] == 1 else f"{base}_{name_counts[base]}.pdf"

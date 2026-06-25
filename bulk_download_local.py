@@ -344,7 +344,9 @@ async def download_documents(page, docs, order, out_dir: Path):
     downloaded = already = 0
     names = []
     for doc in docs:
-        base = f"{order['equipment_id']}_{order['order_id']}_{safe_name(doc['doc_type'])}".strip("_")
+        # Sanitize EVERY part — some equipment IDs contain "/" (e.g. "703/11787"),
+        # which would otherwise be treated as a folder path and the write fails.
+        base = f"{safe_name(order['equipment_id'])}_{order['order_id']}_{safe_name(doc['doc_type'])}".strip("_")
         counts[base] = counts.get(base, 0) + 1
         fname = f"{base}.pdf" if counts[base] == 1 else f"{base}_{counts[base]}.pdf"
         names.append(fname)
