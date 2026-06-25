@@ -40,9 +40,9 @@ from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 # Credentials are read from the TKE_USERNAME / TKE_PASSWORD environment
 # variables; if unset, the script asks for them when it starts. (They are NOT
 # stored in this file so it is safe to keep in a public repo.)
-DATE_FROM = "01.01.2023"      # how far back to collect (DD.MM.YYYY)
-DATE_TO   = ""                # leave "" for "today"; or set DD.MM.YYYY
-OUTPUT_DIR = "tke_reports"    # where PDFs are saved
+DATE_FROM = "01.01.2026"      # start of range (DD.MM.YYYY)
+DATE_TO   = "25.06.2026"      # end of range  (DD.MM.YYYY); "" = today
+OUTPUT_DIR = r"C:\Users\elmahdi\Desktop\TKE_REPORTS"   # where PDFs are saved
 HEADLESS  = True              # set False to watch the browser work
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -51,6 +51,33 @@ def get_credentials():
     user = os.environ.get("TKE_USERNAME") or input("TKE username: ").strip()
     pwd = os.environ.get("TKE_PASSWORD") or getpass.getpass("TKE password: ")
     return user, pwd
+
+
+def parse_ddmmyyyy(s: str):
+    """'25.06.2026' -> [2026, 5, 25]  (month 0-based, for JS new Date())."""
+    d, m, y = s.split(".")
+    return [int(y), int(m) - 1, int(d)]
+
+
+# JS that sets both Dojo DateTextBox widgets via their proper API. A plain
+# field.value assignment is ignored by the widget on submit — it serialises
+# its own internal date model — so we must call dijit.byId(...).set('value', …).
+_SET_DATES_JS = """([fromArr, toArr]) => {
+    const setDate = (id, a) => {
+        const w = window.dijit && dijit.byId && dijit.byId(id);
+        if (w) { w.set('value', new Date(a[0], a[1], a[2])); }
+        else {
+            const el = document.getElementById(id);
+            if (el) {
+                const dd = String(a[2]).padStart(2,'0'), mm = String(a[1]+1).padStart(2,'0');
+                el.value = dd + '.' + mm + '.' + a[0];
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+            }
+        }
+    };
+    setDate('ServiceOrderSearchSearchFormorderDateFrom_field', fromArr);
+    setDate('ServiceOrderSearchSearchFormorderDateTo_field', toArr);
+}"""
 
 PORTAL_ORDERS_URL = "https://de.webportal.tkelevator.com/wps/myportal/customer/home/orders/"
 INDEX_FILE = "orders_index.json"
@@ -126,31 +153,36 @@ async def collect_all_orders(page, date_from: str, date_to: str):
     await page.goto(PORTAL_ORDERS_URL, wait_until="domcontentloaded", timeout=60_000)
     await page.wait_for_selector("#ServiceOrderSearchSearchFormid_field", timeout=30_000)
 
-    # Fill the date range, clear the Id field, run the search.
+    # Set the date range via the Dojo widget API and clear the Id field.
+    await page.evaluate(_SET_DATES_JS, [parse_ddmmyyyy(date_from), parse_ddmmyyyy(date_to)])
     await page.evaluate(
-        """([df, dt]) => {
-            const setVal = (id, v) => {
-                const el = document.getElementById(id);
-                if (el) {
-                    el.value = v;
-                    el.dispatchEvent(new Event('change', {bubbles: true}));
-                    el.dispatchEvent(new Event('blur', {bubbles: true}));
-                }
-            };
-            setVal('ServiceOrderSearchSearchFormorderDateFrom_field', df);
-            setVal('ServiceOrderSearchSearchFormorderDateTo_field', dt);
-            setVal('ServiceOrderSearchSearchFormid_field', '');
+        """() => {
+            const idf = document.getElementById('ServiceOrderSearchSearchFormid_field');
+            if (idf) { idf.value = ''; idf.dispatchEvent(new Event('change', {bubbles: true})); }
+            // Tag the CURRENT rows so we can detect when the search replaces them.
+            document.querySelectorAll('tr[name="DataContainer"]').forEach(tr => tr.setAttribute('data-pre', '1'));
+        }"""
+    )
+    # Click Search, then wait until every pre-tagged row is gone — i.e. the
+    # portal's AJAX has actually swapped in the new result table. This is
+    # reliable even when page 1 looks unchanged (end date == default newest),
+    # and avoids reading stale default rows before the search renders.
+    await page.evaluate(
+        """() => {
             const btn = Array.from(document.querySelectorAll('a,button,input'))
-                .find(b => {
-                    const t = (b.textContent || b.value || '').trim();
-                    return t === 'Suchen' || t === 'Search';
-                });
+                .find(b => { const t=(b.textContent||b.value||'').trim(); return t==='Suchen'||t==='Search'; });
             if (!btn) throw new Error('search button not found');
             btn.click();
-        }""",
-        [date_from, date_to],
+        }"""
     )
-    await page.wait_for_timeout(3500)  # let the AJAX search settle
+    try:
+        await page.wait_for_function(
+            """() => document.querySelectorAll('tr[name="DataContainer"][data-pre="1"]').length === 0""",
+            timeout=30_000,
+        )
+    except PWTimeout:
+        pass
+    await page.wait_for_timeout(1000)  # settle while the new rows finish rendering
 
     orders, seen = [], set()
     page_num = 1
@@ -198,10 +230,11 @@ async def collect_all_orders(page, date_from: str, date_to: str):
 async def search_and_open(page, order_id: str, from_date: str) -> bool:
     await page.goto(PORTAL_ORDERS_URL, wait_until="domcontentloaded", timeout=60_000)
     await page.wait_for_selector("#ServiceOrderSearchSearchFormid_field", timeout=30_000)
+    # Use a deliberately wide range so any order id is found regardless of its
+    # date (the per-id search still pins it to exactly one order).
+    await page.evaluate(_SET_DATES_JS, [[2015, 0, 1], [2035, 11, 31]])
     await page.evaluate(
-        """([orderId, fromDate]) => {
-            const df = document.getElementById('ServiceOrderSearchSearchFormorderDateFrom_field');
-            if (df) { df.value = fromDate; df.dispatchEvent(new Event('change',{bubbles:true})); df.dispatchEvent(new Event('blur',{bubbles:true})); }
+        """(orderId) => {
             const idf = document.getElementById('ServiceOrderSearchSearchFormid_field');
             idf.focus(); idf.value = orderId; idf.dispatchEvent(new Event('change',{bubbles:true}));
             const btn = Array.from(document.querySelectorAll('a,button,input'))
@@ -209,7 +242,7 @@ async def search_and_open(page, order_id: str, from_date: str) -> bool:
             if (!btn) throw new Error('no search button');
             btn.click();
         }""",
-        [order_id, from_date],
+        order_id,
     )
     try:
         await page.wait_for_function(
