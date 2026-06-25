@@ -6,3 +6,6 @@ venv/
 *.pdf
 Orders*.html
 .streamlit/secrets.toml
+
+orders_index.json
+tke_reports/
