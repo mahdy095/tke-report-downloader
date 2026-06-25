@@ -29,12 +29,21 @@ lets you stop and resume any time.
 import asyncio
 import os
 import re
+import sys
 import json
 import getpass
 import datetime
 from pathlib import Path
 
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+
+# Make console output robust to non-UTF-8 terminals/redirects (Windows cp1252
+# otherwise crashes on characters like → or ✓ in log messages).
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 # ─────────────────────────── CONFIG ────────────────────────────────────────
 # Credentials are read from the TKE_USERNAME / TKE_PASSWORD environment
@@ -249,9 +258,21 @@ async def collect_all_orders(page, date_from: str, date_to: str):
 
 # ───────────────── phase 2: open each order and download PDFs ───────────────
 
-async def search_and_open(page, order_id: str, from_date: str) -> bool:
+async def search_and_open(page, order_id: str, from_date: str,
+                          username: str = "", password: str = "") -> bool:
     await page.goto(PORTAL_ORDERS_URL, wait_until="domcontentloaded", timeout=60_000)
-    await page.wait_for_selector("#ServiceOrderSearchSearchFormid_field", timeout=30_000)
+    try:
+        await page.wait_for_selector("#ServiceOrderSearchSearchFormid_field", timeout=30_000)
+    except PWTimeout:
+        # The orders search form is gone — the portal session has expired and
+        # we were bounced to the login page. Re-authenticate and continue.
+        if not (username and password):
+            raise
+        log("  ⚠ session expired — re-logging in…")
+        if not await login(page, username, password):
+            raise RuntimeError("re-login failed")
+        await page.goto(PORTAL_ORDERS_URL, wait_until="domcontentloaded", timeout=60_000)
+        await page.wait_for_selector("#ServiceOrderSearchSearchFormid_field", timeout=30_000)
     # Use a deliberately wide range and ALL types so any order id is found
     # regardless of its date/type (the per-id search still pins it to one order).
     await page.evaluate(_SET_DATES_JS, [[2015, 0, 1], [2035, 11, 31]])
@@ -381,7 +402,7 @@ async def main():
                 log(f"[{i}/{total}] {oid} — already have {len(existing)} file(s), skip")
                 continue
             try:
-                if not await search_and_open(page, oid, DATE_FROM):
+                if not await search_and_open(page, oid, DATE_FROM, username, password):
                     failed += 1
                     log(f"[{i}/{total}] {oid} — not found")
                     continue
