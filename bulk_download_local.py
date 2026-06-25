@@ -42,9 +42,24 @@ from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 # stored in this file so it is safe to keep in a public repo.)
 DATE_FROM = "01.01.2026"      # start of range (DD.MM.YYYY)
 DATE_TO   = "25.06.2026"      # end of range  (DD.MM.YYYY); "" = today
-OUTPUT_DIR = r"C:\Users\elmahdi\Desktop\TKE_REPORTS"   # where PDFs are saved
+ORDER_TYPE = "Wartung"        # "Wartung", "Serviceeinsatz", "Reparatur", or "" for ALL types
+OUTPUT_DIR = r"C:\Users\elmahdi\Desktop\TKE_REPORTS"   # where PDFs (and the log) are saved
 HEADLESS  = True              # set False to watch the browser work
 # ────────────────────────────────────────────────────────────────────────────
+
+# Order-type dropdown codes (dijit.form.FilteringSelect). "" = all types.
+TYPE_CODES = {"": "", "Wartung": "02", "Serviceeinsatz": "05", "Reparatur": "10"}
+
+# ── file + console logging (log .txt lands next to the PDFs) ────────────────
+_LOG_FH = None
+
+def log(*args):
+    msg = " ".join(str(a) for a in args)
+    print(msg)
+    if _LOG_FH:
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _LOG_FH.write(f"[{stamp}] {msg}\n")
+        _LOG_FH.flush()
 
 
 def get_credentials():
@@ -77,6 +92,12 @@ _SET_DATES_JS = """([fromArr, toArr]) => {
     };
     setDate('ServiceOrderSearchSearchFormorderDateFrom_field', fromArr);
     setDate('ServiceOrderSearchSearchFormorderDateTo_field', toArr);
+}"""
+
+# JS that sets the order-type FilteringSelect (e.g. "02" = Wartung; "" = all).
+_SET_TYPE_JS = """(code) => {
+    const w = window.dijit && dijit.byId && dijit.byId('ServiceOrderSearchSearchFormtype_field');
+    if (w) { w.set('value', code); }
 }"""
 
 PORTAL_ORDERS_URL = "https://de.webportal.tkelevator.com/wps/myportal/customer/home/orders/"
@@ -153,8 +174,9 @@ async def collect_all_orders(page, date_from: str, date_to: str):
     await page.goto(PORTAL_ORDERS_URL, wait_until="domcontentloaded", timeout=60_000)
     await page.wait_for_selector("#ServiceOrderSearchSearchFormid_field", timeout=30_000)
 
-    # Set the date range via the Dojo widget API and clear the Id field.
+    # Set the date range + order-type via the Dojo widget APIs, clear the Id field.
     await page.evaluate(_SET_DATES_JS, [parse_ddmmyyyy(date_from), parse_ddmmyyyy(date_to)])
+    await page.evaluate(_SET_TYPE_JS, TYPE_CODES.get(ORDER_TYPE, ""))
     await page.evaluate(
         """() => {
             const idf = document.getElementById('ServiceOrderSearchSearchFormid_field');
@@ -190,7 +212,7 @@ async def collect_all_orders(page, date_from: str, date_to: str):
         try:
             await page.wait_for_selector('tr[name="DataContainer"]', timeout=15_000)
         except PWTimeout:
-            print(f"  page {page_num}: no rows (empty result)")
+            log(f"  page {page_num}: no rows (empty result)")
             break
 
         rows = await _read_rows(page)
@@ -200,7 +222,7 @@ async def collect_all_orders(page, date_from: str, date_to: str):
                 seen.add(r["order_id"])
                 orders.append(r)
                 new += 1
-        print(f"  page {page_num}: {len(rows)} rows ({new} new) — running total {len(orders)}")
+        log(f"  page {page_num}: {len(rows)} rows ({new} new) — running total {len(orders)}")
 
         nxt = await page.query_selector('a[name="nextPage"]')
         if not nxt:
@@ -217,7 +239,7 @@ async def collect_all_orders(page, date_from: str, date_to: str):
                 arg=first_before, timeout=25_000,
             )
         except PWTimeout:
-            print("  (next page did not change — stopping)")
+            log("  (next page did not change — stopping)")
             break
         page_num += 1
         await page.wait_for_timeout(400)
@@ -230,9 +252,10 @@ async def collect_all_orders(page, date_from: str, date_to: str):
 async def search_and_open(page, order_id: str, from_date: str) -> bool:
     await page.goto(PORTAL_ORDERS_URL, wait_until="domcontentloaded", timeout=60_000)
     await page.wait_for_selector("#ServiceOrderSearchSearchFormid_field", timeout=30_000)
-    # Use a deliberately wide range so any order id is found regardless of its
-    # date (the per-id search still pins it to exactly one order).
+    # Use a deliberately wide range and ALL types so any order id is found
+    # regardless of its date/type (the per-id search still pins it to one order).
     await page.evaluate(_SET_DATES_JS, [[2015, 0, 1], [2035, 11, 31]])
+    await page.evaluate(_SET_TYPE_JS, "")
     await page.evaluate(
         """(orderId) => {
             const idf = document.getElementById('ServiceOrderSearchSearchFormid_field');
@@ -306,10 +329,17 @@ async def download_documents(page, docs, order, out_dir: Path):
 # ─────────────────────────────── main ──────────────────────────────────────
 
 async def main():
+    global _LOG_FH
     username, password = get_credentials()
     date_to = DATE_TO.strip() or today_ddmmyyyy()
     out_dir = Path(OUTPUT_DIR)
-    out_dir.mkdir(exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Log file lands next to the PDFs; the resume checkpoint too.
+    _LOG_FH = open(out_dir / "download_log.txt", "a", encoding="utf-8")
+    index_path = out_dir / INDEX_FILE
+    log("=" * 60)
+    log(f"RUN START — type={ORDER_TYPE or 'ALL'} | range {DATE_FROM} → {date_to} | out={out_dir}")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -323,22 +353,22 @@ async def main():
         )
         page = await ctx.new_page()
 
-        print("Logging in…")
+        log("Logging in…")
         if not await login(page, username, password):
-            print("LOGIN FAILED — check your username/password.")
+            log("LOGIN FAILED — check your username/password.")
             await browser.close()
             return
-        print("Logged in.\n")
+        log("Logged in.\n")
 
         # Phase 1 — collect every order (resumable via the index file)
-        if Path(INDEX_FILE).exists():
-            orders = json.loads(Path(INDEX_FILE).read_text(encoding="utf-8"))
-            print(f"Loaded {len(orders)} orders from {INDEX_FILE} (delete it to re-scan).\n")
+        if index_path.exists():
+            orders = json.loads(index_path.read_text(encoding="utf-8"))
+            log(f"Loaded {len(orders)} orders from {index_path.name} (delete it to re-scan).\n")
         else:
-            print(f"Collecting all orders from {DATE_FROM} to {date_to} …")
+            log(f"Collecting {ORDER_TYPE or 'all'} orders from {DATE_FROM} to {date_to} …")
             orders = await collect_all_orders(page, DATE_FROM, date_to)
-            Path(INDEX_FILE).write_text(json.dumps(orders, ensure_ascii=False, indent=2), encoding="utf-8")
-            print(f"\nCollected {len(orders)} orders → saved to {INDEX_FILE}\n")
+            index_path.write_text(json.dumps(orders, ensure_ascii=False, indent=2), encoding="utf-8")
+            log(f"\nCollected {len(orders)} orders → saved to {index_path.name}\n")
 
         # Phase 2 — download each order's PDFs (skip ones already on disk)
         total = len(orders)
@@ -348,31 +378,33 @@ async def main():
             existing = list(out_dir.glob(f"*_{oid}_*.pdf"))
             if existing:
                 skipped += 1
-                print(f"[{i}/{total}] {oid} — already have {len(existing)} file(s), skip")
+                log(f"[{i}/{total}] {oid} — already have {len(existing)} file(s), skip")
                 continue
             try:
                 if not await search_and_open(page, oid, DATE_FROM):
                     failed += 1
-                    print(f"[{i}/{total}] {oid} — not found")
+                    log(f"[{i}/{total}] {oid} — not found")
                     continue
                 docs = await collect_documents(page)
                 if not docs:
-                    print(f"[{i}/{total}] {oid} — no documents")
+                    log(f"[{i}/{total}] {oid} — no documents")
                     continue
                 n = await download_documents(page, docs, order, out_dir)
                 pdfs += n
                 done += 1
-                print(f"[{i}/{total}] {oid} — {n} PDF(s)  (total files: {pdfs})")
+                log(f"[{i}/{total}] {oid} — {n} PDF(s)  (total files: {pdfs})")
             except Exception as exc:
                 failed += 1
-                print(f"[{i}/{total}] {oid} — ERROR: {type(exc).__name__}: {exc}")
+                log(f"[{i}/{total}] {oid} — ERROR: {type(exc).__name__}: {exc}")
 
         await browser.close()
 
-    print("\n──────── DONE ────────")
-    print(f"Orders processed: {done} | skipped (already had): {skipped} | failed: {failed}")
-    print(f"PDFs downloaded this run: {pdfs}")
-    print(f"All files are in: {out_dir.resolve()}")
+    log("\n──────── DONE ────────")
+    log(f"Orders processed: {done} | skipped (already had): {skipped} | failed: {failed}")
+    log(f"PDFs downloaded this run: {pdfs}")
+    log(f"All files are in: {out_dir.resolve()}")
+    if _LOG_FH:
+        _LOG_FH.close()
 
 
 if __name__ == "__main__":
