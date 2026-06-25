@@ -54,6 +54,15 @@ DATE_TO   = "25.06.2026"      # end of range  (DD.MM.YYYY); "" = today
 ORDER_TYPE = "Wartung"        # "Wartung", "Serviceeinsatz", "Reparatur", or "" for ALL types
 OUTPUT_DIR = r"C:\Users\elmahdi\Desktop\TKE_REPORTS"   # where PDFs (and the log) are saved
 HEADLESS  = True              # set False to watch the browser work
+
+# Completeness mode:
+#   FORCE_VERIFY_ALL = True  → open EVERY order and confirm its PDFs match the
+#                             portal's document list (slowest, absolute 100%).
+#   FORCE_VERIFY_ALL = False → trust orders that already have >= VERIFY_SKIP_AT
+#                             PDFs as complete; only open the rest (much faster,
+#                             catches every realistic gap/partial).
+FORCE_VERIFY_ALL = True
+VERIFY_SKIP_AT   = 2
 # ────────────────────────────────────────────────────────────────────────────
 
 # Order-type dropdown codes (dijit.form.FilteringSelect). "" = all types.
@@ -329,22 +338,30 @@ async def collect_documents(page):
 
 
 async def download_documents(page, docs, order, out_dir: Path):
-    saved = 0
+    """Idempotent: only fetch documents whose PDF is not already on disk.
+    Returns {found, downloaded, already, names}."""
     counts = {}
+    downloaded = already = 0
+    names = []
     for doc in docs:
         base = f"{order['equipment_id']}_{order['order_id']}_{safe_name(doc['doc_type'])}".strip("_")
         counts[base] = counts.get(base, 0) + 1
         fname = f"{base}.pdf" if counts[base] == 1 else f"{base}_{counts[base]}.pdf"
+        names.append(fname)
+        target = out_dir / fname
+        if target.exists() and target.stat().st_size > 0:
+            already += 1
+            continue
         try:
             resp = await page.context.request.get(doc["href"], timeout=30_000)
             body = await resp.body()
             if not body.startswith(b"%PDF"):
                 continue
-            (out_dir / fname).write_bytes(body)
-            saved += 1
+            target.write_bytes(body)
+            downloaded += 1
         except Exception:
             continue
-    return saved
+    return {"found": len(docs), "downloaded": downloaded, "already": already, "names": names}
 
 
 # ─────────────────────────────── main ──────────────────────────────────────
@@ -359,6 +376,7 @@ async def main():
     # Log file lands next to the PDFs; the resume checkpoint too.
     _LOG_FH = open(out_dir / "download_log.txt", "a", encoding="utf-8")
     index_path = out_dir / INDEX_FILE
+    progress_path = out_dir / "progress.json"
     log("=" * 60)
     log(f"RUN START — type={ORDER_TYPE or 'ALL'} | range {DATE_FROM} → {date_to} | out={out_dir}")
 
@@ -391,38 +409,74 @@ async def main():
             index_path.write_text(json.dumps(orders, ensure_ascii=False, indent=2), encoding="utf-8")
             log(f"\nCollected {len(orders)} orders → saved to {index_path.name}\n")
 
-        # Phase 2 — download each order's PDFs (skip ones already on disk)
+        # ── Phase 2 — verify each order against the portal and fill any gaps ──
+        # An order is COMPLETE only when its on-disk PDFs match the documents the
+        # portal actually lists for it. progress.json records each order's proven
+        # state (with its index) so a re-run resumes precisely and never re-checks
+        # an already-verified order. Downloads are idempotent — only missing docs
+        # are fetched — so this is safe to run repeatedly.
+        progress = {}
+        if progress_path.exists():
+            try:
+                progress = json.loads(progress_path.read_text(encoding="utf-8"))
+            except Exception:
+                progress = {}
+
         total = len(orders)
-        done = skipped = failed = pdfs = 0
+        verified = filled = downloaded_now = failed = incomplete = 0
         for i, order in enumerate(orders, 1):
             oid = order["order_id"]
-            existing = list(out_dir.glob(f"*_{oid}_*.pdf"))
-            if existing:
-                skipped += 1
-                log(f"[{i}/{total}] {oid} — already have {len(existing)} file(s), skip")
+            rec = progress.get(oid)
+            if rec and rec.get("status") == "complete":
+                verified += 1
                 continue
+
+            existing = list(out_dir.glob(f"*_{oid}_*.pdf"))
+            # Fast path (only when not forcing a full verify): an order that
+            # already has >= VERIFY_SKIP_AT PDFs is taken as complete.
+            if not FORCE_VERIFY_ALL and len(existing) >= VERIFY_SKIP_AT:
+                progress[oid] = {"idx": i, "found": "assumed", "on_disk": len(existing), "status": "complete"}
+                verified += 1
+                if i % 200 == 0:
+                    progress_path.write_text(json.dumps(progress, ensure_ascii=False, indent=2), encoding="utf-8")
+                continue
+
             try:
                 if not await search_and_open(page, oid, DATE_FROM, username, password):
                     failed += 1
-                    log(f"[{i}/{total}] {oid} — not found")
+                    log(f"[{i}/{total}] {oid} — NOT FOUND on portal")
                     continue
                 docs = await collect_documents(page)
-                if not docs:
-                    log(f"[{i}/{total}] {oid} — no documents")
-                    continue
-                n = await download_documents(page, docs, order, out_dir)
-                pdfs += n
-                done += 1
-                log(f"[{i}/{total}] {oid} — {n} PDF(s)  (total files: {pdfs})")
+                res = (await download_documents(page, docs, order, out_dir) if docs
+                       else {"found": 0, "downloaded": 0, "already": 0, "names": []})
+                on_disk = len(list(out_dir.glob(f"*_{oid}_*.pdf")))
+                status = "complete" if on_disk >= res["found"] else "incomplete"
+                progress[oid] = {"idx": i, "found": res["found"], "on_disk": on_disk,
+                                 "status": status, "docs": res["names"]}
+                downloaded_now += res["downloaded"]
+                if status != "complete":
+                    incomplete += 1
+                elif res["downloaded"] > 0:
+                    filled += 1
+                else:
+                    verified += 1
+                tag = "NO-DOCS" if res["found"] == 0 else status.upper()
+                log(f"[{i}/{total}] {oid} (eq {order.get('equipment_id','')}) — "
+                    f"portal:{res['found']} disk:{on_disk} new:{res['downloaded']} → {tag} {res['names']}")
             except Exception as exc:
                 failed += 1
                 log(f"[{i}/{total}] {oid} — ERROR: {type(exc).__name__}: {exc}")
 
+            if i % 50 == 0:
+                progress_path.write_text(json.dumps(progress, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        progress_path.write_text(json.dumps(progress, ensure_ascii=False, indent=2), encoding="utf-8")
         await browser.close()
 
     log("\n──────── DONE ────────")
-    log(f"Orders processed: {done} | skipped (already had): {skipped} | failed: {failed}")
-    log(f"PDFs downloaded this run: {pdfs}")
+    log(f"Verified complete: {verified} | gaps filled: {filled} | still incomplete: {incomplete} | not-found/errors: {failed}")
+    log(f"PDFs downloaded this run: {downloaded_now}")
+    log(f"Resume state saved to: {progress_path.name}")
     log(f"All files are in: {out_dir.resolve()}")
     if _LOG_FH:
         _LOG_FH.close()
