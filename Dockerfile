@@ -11,6 +11,7 @@ FROM python:3.12-slim
 
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1 \
     HOME=/home/user \
     PATH=/home/user/.local/bin:$PATH \
     STREAMLIT_SERVER_PORT=7860 \
