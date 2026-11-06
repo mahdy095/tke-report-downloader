@@ -49,10 +49,10 @@ except Exception:
 # Credentials are read from the TKE_USERNAME / TKE_PASSWORD environment
 # variables; if unset, the script asks for them when it starts. (They are NOT
 # stored in this file so it is safe to keep in a public repo.)
-DATE_FROM = "01.01.2026"      # start of range (DD.MM.YYYY)
-DATE_TO   = "25.06.2026"      # end of range  (DD.MM.YYYY); "" = today
+DATE_FROM = "26.06.2026"      # start of range (DD.MM.YYYY)
+DATE_TO   = "15.07.2026"      # end of range  (DD.MM.YYYY); "" = today
 ORDER_TYPE = "Wartung"        # "Wartung", "Serviceeinsatz", "Reparatur", or "" for ALL types
-OUTPUT_DIR = r"C:\Users\elmahdi\Desktop\TKE_REPORTS"   # where PDFs (and the log) are saved
+OUTPUT_DIR = str(Path(__file__).resolve().parent / "bulk_download_output")   # where PDFs (and the log) are saved; keep it out of git (.git/info/exclude)
 HEADLESS  = True              # set False to watch the browser work
 
 # Completeness mode:
